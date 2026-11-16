@@ -122,11 +122,73 @@ function accountScope(status) {
   return createHash('sha256').update(email.trim().toLowerCase()).digest('hex');
 }
 
+function slimGeneratorItem(item) {
+  if (!item || typeof item !== 'object') return {};
+  const chat = item.chatModel;
+  if (!chat || typeof chat !== 'object') {
+    return { executionId: item.executionId, responseModel: item.responseModel, response_model: item.response_model };
+  }
+  const usage = chat.usage && typeof chat.usage === 'object' ? {
+    messageId: chat.usage.messageId,
+    responseOutputTokens: chat.usage.responseOutputTokens,
+    outputTokens: chat.usage.outputTokens,
+    thinkingOutputTokens: chat.usage.thinkingOutputTokens,
+    modelDisplayName: chat.usage.modelDisplayName,
+    modelName: chat.usage.modelName,
+    model: chat.usage.model,
+    responseModel: chat.usage.responseModel,
+    response_model: chat.usage.response_model
+  } : undefined;
+  const rawCtx = chat.chatStartMetadata?.contextWindowMetadata;
+  const chatStartMetadata = chat.chatStartMetadata && typeof chat.chatStartMetadata === 'object' ? {
+    modelDisplayName: chat.chatStartMetadata.modelDisplayName,
+    model: chat.chatStartMetadata.model,
+    responseModel: chat.chatStartMetadata.responseModel,
+    response_model: chat.chatStartMetadata.response_model,
+    contextWindowMetadata: rawCtx && typeof rawCtx === 'object' ? {
+      estimatedTokensUsed: rawCtx.estimatedTokensUsed,
+      maxContextTokens: rawCtx.maxContextTokens
+    } : undefined
+  } : undefined;
+  const alias = chat.modelOrAlias && typeof chat.modelOrAlias === 'object' ? {
+    model: chat.modelOrAlias.model,
+    alias: chat.modelOrAlias.alias
+  } : undefined;
+  return {
+    executionId: item.executionId,
+    responseModel: item.responseModel,
+    response_model: item.response_model,
+    chatModel: {
+      modelDisplayName: chat.modelDisplayName,
+      modelName: chat.modelName,
+      model: chat.model,
+      modelOrAlias: alias,
+      responseModel: chat.responseModel,
+      response_model: chat.response_model,
+      servedModel: chat.servedModel,
+      served_model: chat.served_model,
+      modelEndpoint: chat.modelEndpoint,
+      endpointModel: chat.endpointModel,
+      actualModel: chat.actualModel,
+      backendModel: chat.backendModel,
+      modelId: chat.modelId,
+      streamingDuration: chat.streamingDuration,
+      timeToFirstToken: chat.timeToFirstToken,
+      usage,
+      chatStartMetadata
+    }
+  };
+}
+
+const MAX_CACHED_CONVERSATIONS = 8;
+
 class ContextMonitor {
   constructor(client) {
     this.client = client;
     this.generation = 0;
     this.pending = new Map();
+    this.cache = new Map();
+    this.cacheScope = '';
   }
 
   sample(id) {
@@ -147,12 +209,41 @@ class ContextMonitor {
       const server = await this.client.discover();
       const firstStatus = await this.client.call('GetUserStatus', {}, signal);
       const identity = accountScope(firstStatus);
-      const metadata = await this.client.metadata(id, signal);
-      const result = summarizeMetadata(metadata, extractModelMap(firstStatus));
+      const scope = `${server.pid}:${server.port}:${identity}`;
+      if (this.cacheScope !== scope) {
+        this.cache.clear();
+        this.cacheScope = scope;
+      }
+      const key = id.toLowerCase();
+      let items;
+      const cached = this.client.supportsIncrementalMetadata ? this.cache.get(key) : null;
+      if (cached) {
+        const delta = await this.client.metadata(id, signal, { offset: cached.length });
+        if (Array.isArray(delta)) {
+          items = delta.map(slimGeneratorItem);
+        } else if (delta?.truncated) {
+          this.cache.delete(key);
+          items = (await this.client.metadata(id, signal)).map(slimGeneratorItem);
+        } else {
+          const appended = (delta?.items || []).map(slimGeneratorItem);
+          if (cached.length + appended.length > 10000) throw new Error('统计样本范围不支持');
+          items = appended.length ? [...cached, ...appended] : cached;
+        }
+      } else {
+        items = (await this.client.metadata(id, signal)).map(slimGeneratorItem);
+      }
+      const result = summarizeMetadata(items, extractModelMap(firstStatus));
       const currentIdentity = accountScope(await this.client.call('GetUserStatus', {}, signal));
       const currentServer = await this.client.discover();
       if (generation !== this.generation || identity !== currentIdentity || server.pid !== currentServer.pid
         || server.csrf !== currentServer.csrf || server.port !== currentServer.port) throw new Error('采集作用域已改变');
+      if (this.client.supportsIncrementalMetadata && this.cacheScope === scope) {
+        this.cache.delete(key);
+        this.cache.set(key, items);
+        while (this.cache.size > MAX_CACHED_CONVERSATIONS) {
+          this.cache.delete(this.cache.keys().next().value);
+        }
+      }
       return { conversationId: id, state: 'live', sampledAt: Date.now(), ...result };
     } catch {
       // No raw backend error, command line, credentials or message text crosses the bridge.
@@ -163,6 +254,8 @@ class ContextMonitor {
   reset() {
     this.generation++;
     this.pending.clear();
+    this.cache.clear();
+    this.cacheScope = '';
     this.client.reset();
   }
 }
